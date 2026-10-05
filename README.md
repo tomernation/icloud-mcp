@@ -4,14 +4,14 @@
 [![Release](https://img.shields.io/github/v/release/ThomasCrouzet/icloud-mcp)](https://github.com/ThomasCrouzet/icloud-mcp/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-This unified **Apple/iCloud** MCP server supports **Calendar, Contacts, and
-Mail**. It is one static Go binary. It uses
-[Model Context Protocol](https://modelcontextprotocol.io) JSON-RPC on **stdio**.
+This unified **Apple/iCloud** MCP server supports **Calendar, Contacts, Mail, and optional Reminders**.
+The core is a static Go binary; Reminders uses a pinned Python worker. It uses
+[Model Context Protocol](https://modelcontextprotocol.io) JSON-RPC on **stdio** or the authenticated HTTP transport.
 
-The server uses only remote protocols: CalDAV, CardDAV, IMAP, and SMTP with
-app-specific passwords. It does not use macOS EventKit, AppleScript, browser
-automation, or a private Apple API. It runs headless on Linux and macOS. Pure
-Go also builds for Windows.
+Calendar, Contacts and Mail use CalDAV, CardDAV, IMAP and SMTP with
+app-specific passwords. Optional Reminders uses the private iCloud CloudKit
+web API with a separately authenticated Apple session and 2FA. It runs
+headless on the Pi; no macOS APIs are needed. The Go core also builds for Windows.
 
 CI runs a `windows/amd64` smoke build. GitHub Release archives contain
 linux/amd64, linux/arm64, and darwin/arm64 builds. Agents, orchestrators, and
@@ -31,10 +31,11 @@ host-specific config files or `.env`.
 | Mail read | IMAP TLS | Off until `ICLOUD_MCP_ENABLE_MAIL` |
 | Mail mutation | IMAP | Off until Mail + `ICLOUD_MCP_ENABLE_MAIL_WRITE` |
 | Mail send | SMTP STARTTLS | Off until Mail + `ICLOUD_MCP_ENABLE_MAIL_SEND` + recipient policy |
+| Reminders | Private CloudKit web API | Off until `ICLOUD_MCP_ENABLE_REMINDERS` + authenticated web session |
 
-Reminders, Notes, Photos, Drive, Messages, and similar apps are **out of scope**.
-They remain out of scope until Apple documents a suitable remote third-party
-connector. See [Supported scope](#supported-scope).
+Reminders setup, deployment, session renewal, supported fields and limitations
+are documented in [Reminders web API](docs/reminders-web-api.md). Notes, Photos,
+Drive and Messages remain out of scope. See [Supported scope](#supported-scope).
 
 ## Quick start
 
@@ -266,7 +267,8 @@ budgets, and retry rules:
 | Calendar | CalDAV | Always |
 | Contacts | CardDAV | Optional |
 | Mail read / mutation / send | IMAP + SMTP | Optional, independently gated |
-| Modern Reminders, Notes, Photos, Drive, Find My, Keychain, Messages, Home | No suitable official remote connector for this model | Excluded |
+| Modern Reminders | Private CloudKit web API + Python worker | Optional, separate Apple web session |
+| Notes, Photos, Drive, Find My, Keychain, Messages, Home | No connector implemented | Excluded |
 
 The server does not treat modern Reminders as generic CalDAV VTODO. Apple's
 third-party documentation for this type of access covers Mail, Calendar, and
@@ -372,3 +374,7 @@ before opening a pull request.
 ## License
 
 MIT. See [LICENSE](LICENSE) and [third-party notices](THIRD_PARTY_NOTICES.md).
+
+## Optional private remote hosting
+
+See [remote hosting](docs/remote-hosting.md) for the opt-in TLS Streamable HTTP transport, owner-only OAuth contract, secret-free container configuration and scheduler migration plan. Stdio remains the default.

@@ -1,0 +1,40 @@
+---
+- name: Verify recovery boundaries without changing data
+  hosts: pi
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Read running container status only
+      ansible.builtin.command:
+        argv: [docker, inspect, --format, '{{ "{{.State.Running}}" }}', '{{ item }}']
+      loop: [icloud-auth-database-1, icloud-auth-keycloak-1, icloud-mcp-icloud-1, icloud-mcp-proxy-1]
+      register: running
+      changed_when: false
+      failed_when: running.stdout != 'true'
+
+    - name: Confirm database accepts connections
+      ansible.builtin.command:
+        argv: [docker, exec, icloud-auth-database-1, pg_isready, -U, keycloak, -d, keycloak]
+      changed_when: false
+
+    - name: Check OAuth discovery via local proxy with public hostname and certificate validation
+      ansible.builtin.command:
+        argv: [curl, --silent, --show-error, --fail, --tlsv1.3, --resolve, '{{ auth_hostname }}:443:127.0.0.1', 'https://{{ auth_hostname }}/realms/{{ realm }}/.well-known/openid-configuration']
+      register: discovery
+      changed_when: false
+      failed_when: discovery.rc != 0 or (discovery.stdout | from_json).issuer != 'https://' + auth_hostname + '/realms/' + realm
+      retries: 18
+      delay: 5
+      until: discovery.rc == 0
+
+    - name: Confirm MCP rejects anonymous access
+      ansible.builtin.command:
+        argv: [curl, --silent, --show-error, --tlsv1.3, --resolve, '{{ mcp_hostname }}:443:127.0.0.1', --output, /dev/null, --write-out, '%{http_code}', 'https://{{ mcp_hostname }}/mcp']
+      register: anonymous
+      changed_when: false
+      failed_when: anonymous.rc != 0 or anonymous.stdout != '401'
+
+    - name: Verify DuckDNS timer is active
+      ansible.builtin.command:
+        argv: [systemctl, is-active, duckdns.timer]
+      changed_when: false

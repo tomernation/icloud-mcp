@@ -1,0 +1,36 @@
+{
+    admin off
+    auto_https disable_redirects
+    servers {
+        protocols h1 h2
+    }
+}
+
+icloud.chasid.net {
+    tls {
+        protocols tls1.3 tls1.3
+        issuer acme {
+            disable_http_challenge
+        }
+    }
+    reverse_proxy https://icloud:8443 {
+        header_up Host icloud.chasid.net
+        transport http {
+            tls_server_name icloud.chasid.net
+            tls_trust_pool file /etc/caddy/backend-ca.pem
+        }
+    }
+}
+
+auth.chasid.net {
+    redir / /realms/icloud/account/ 302
+    tls {
+        protocols tls1.3 tls1.3
+        issuer acme {
+            disable_http_challenge
+        }
+    }
+    @private path /admin* /realms/master* /health* /metrics*
+    respond @private 404
+    reverse_proxy keycloak:8080
+}

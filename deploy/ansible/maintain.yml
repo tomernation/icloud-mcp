@@ -1,0 +1,11 @@
+---
+- name: Maintain existing services without version upgrades
+  hosts: pi
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Reconcile containers only when explicitly requested
+      ansible.builtin.include_tasks: tasks/start.yml
+      when: repair_services | bool
+
+- ansible.builtin.import_playbook: verify.yml

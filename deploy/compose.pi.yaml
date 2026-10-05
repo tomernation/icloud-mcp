@@ -1,0 +1,61 @@
+name: icloud-mcp
+services:
+  icloud:
+    profiles: [production]
+    image: icloud-mcp:pi-local
+    build:
+      context: ..
+      dockerfile: Dockerfile.remote
+    platform: linux/arm64
+    restart: unless-stopped
+    env_file: ./pi.env
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 512m
+    cpus: 1.5
+    pids_limit: 128
+    volumes:
+      - /var/lib/icloud-mcp/secrets:/run/secrets:ro
+      - /var/lib/icloud-mcp/reminders-session:/run/reminders-session
+    tmpfs:
+      - /tmp:mode=1777,size=64m
+    environment:
+      ICLOUD_MCP_REMINDERS_SESSION_DIR: /run/reminders-session
+      ICLOUD_MCP_REMINDERS_WORKER: /opt/reminders_worker.py
+      ICLOUD_MCP_REMINDERS_PYTHON: /opt/reminders/bin/python
+    networks: [backend]
+    logging:
+      driver: local
+      options:
+        max-size: 5m
+        max-file: '2'
+  proxy:
+    profiles: [production]
+    image: caddy:2@sha256:0c994536bddb66445885237f1a5dcc1916bccea922661c76b4e9fc24061f9b52
+    restart: unless-stopped
+    ports:
+      - '443:443/tcp'
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 256m
+    pids_limit: 128
+    volumes:
+      - ./Caddyfile.pi:/etc/caddy/Caddyfile:ro
+      - /var/lib/icloud-mcp/secrets/backend-ca.pem:/etc/caddy/backend-ca.pem:ro
+      - /var/lib/icloud-mcp/caddy-data:/data
+      - /var/lib/icloud-mcp/caddy-config:/config
+    networks: [backend, auth]
+    depends_on: [icloud]
+    logging:
+      driver: local
+      options:
+        max-size: 5m
+        max-file: '2'
+networks:
+  backend: {}
+  auth:
+    external: true
+    name: icloud-auth

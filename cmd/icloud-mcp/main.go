@@ -5,12 +5,14 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"runtime/debug"
 	"strings"
@@ -27,6 +29,7 @@ import (
 	"github.com/ThomasCrouzet/icloud-mcp/internal/icloud"
 	maildomain "github.com/ThomasCrouzet/icloud-mcp/internal/mail"
 	"github.com/ThomasCrouzet/icloud-mcp/internal/mcptools"
+	"github.com/ThomasCrouzet/icloud-mcp/internal/reminders"
 	"github.com/ThomasCrouzet/icloud-mcp/internal/security"
 )
 
@@ -68,6 +71,7 @@ const discoveryTimeout = 20 * time.Second
 var handlerSlots = make(chan struct{}, maxInFlightHandlers)
 
 func main() {
+	httpAddr := flag.String("http", "", "TLS Streamable HTTP address; disabled by default")
 	healthAddr := flag.String("health", "", "HTTP healthcheck address (e.g. 127.0.0.1:8797), disabled if empty")
 	auditFormatFlag := flag.String("audit-format", "json", "mutation audit format on stderr: json (default) or text")
 	showVersion := flag.Bool("version", false, "print the version and exit")
@@ -83,6 +87,15 @@ func main() {
 		log.Fatalf("configuration error: %v", err)
 	}
 
+	remote, err := loadRemoteConfig(*httpAddr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if remote != nil && os.Getenv("ICLOUD_MCP_READ_ONLY") == "" {
+		if err := os.Setenv("ICLOUD_MCP_READ_ONLY", "true"); err != nil {
+			log.Fatal("cannot set hosted read-only default")
+		}
+	}
 	// 1. Configuration: failure = os.Exit(1) BEFORE any network access.
 	// config.Load errors must omit the email and password. This path uses the
 	// default log sink before it installs the Redactor. See config.Validate and
@@ -92,18 +105,24 @@ func main() {
 		log.Fatalf("configuration error: %v", err)
 	}
 
+	if remote != nil && (cfg.EnableContacts || cfg.EnableMail || *healthAddr != "") {
+		log.Fatal("hosted mode permits calendar only; use its TLS /healthz endpoint")
+	}
 	// Fixed production transports remain separate from the shared lifecycle.
 	calendarCredentials := security.CredentialPair{
 		Username: strings.Clone(cfg.Email),
 		Password: strings.Clone(cfg.Password),
 	}
 	httpClient := security.NewICloudHTTPClient(cfg.Timeout)
+	if remote != nil {
+		httpClient.Transport = security.NewAllowlistTransport(&http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS13}, MaxConnsPerHost: 10, IdleConnTimeout: 30 * time.Second}, security.IsICloudHost)
+	}
 	authHTTP := webdav.HTTPClientWithBasicAuth(httpClient, calendarCredentials.Username, calendarCredentials.Password)
 	doer := icloud.NewRetryClassifier(authHTTP)
 	ic := icloud.NewClient(doer, security.ICloudBaseURL, security.IsICloudHost)
 	contactsService, mailService, err := newOptionalServices(cfg)
 	if err == nil {
-		err = runServer(cfg, auditFormat, *healthAddr, ic, contactsService, mailService, os.Stdin, os.Stdout)
+		err = runServerWithRemote(cfg, auditFormat, *healthAddr, ic, contactsService, mailService, os.Stdin, os.Stdout, remote)
 	}
 	if err != nil {
 		log.Printf("server failed: %s", newBootRedactor(cfg).Redact(err.Error()))
@@ -114,6 +133,10 @@ func main() {
 // runServer shares discovery, registration, redaction, and stdio with the
 // fixture executable. Only main constructs production transports.
 func runServer(cfg *config.Config, auditFormat security.AuditFormat, healthAddr string, ic *icloud.Client, contactsService contacts.Service, mailService maildomain.Service, stdin io.Reader, stdout io.Writer) error {
+	return runServerWithRemote(cfg, auditFormat, healthAddr, ic, contactsService, mailService, stdin, stdout, nil)
+}
+
+func runServerWithRemote(cfg *config.Config, auditFormat security.AuditFormat, healthAddr string, ic *icloud.Client, contactsService contacts.Service, mailService maildomain.Service, stdin io.Reader, stdout io.Writer, remote *remoteConfig) error {
 	// 2. Redaction: ALL stderr goes through the RedactingWriter from here on.
 	// Calendar credentials are always covered. Mail credentials and SASL PLAIN
 	// variants are added only when the Mail domain is enabled.
@@ -142,6 +165,26 @@ func runServer(cfg *config.Config, auditFormat security.AuditFormat, healthAddr 
 		cfg.EffectiveMailSend(),
 	)
 
+	var remindersClient *reminders.Client
+	remindersEnabled := os.Getenv("ICLOUD_MCP_ENABLE_REMINDERS") == "true"
+	if raw := os.Getenv("ICLOUD_MCP_ENABLE_REMINDERS"); raw != "" && raw != "true" && raw != "false" {
+		return fmt.Errorf("ICLOUD_MCP_ENABLE_REMINDERS must be true or false")
+	}
+	if remindersEnabled {
+		sessionDir := os.Getenv("ICLOUD_MCP_REMINDERS_SESSION_DIR")
+		script := os.Getenv("ICLOUD_MCP_REMINDERS_WORKER")
+		python := os.Getenv("ICLOUD_MCP_REMINDERS_PYTHON")
+		if sessionDir == "" || script == "" || python == "" {
+			return fmt.Errorf("Reminders requires session directory, worker path, and Python executable configuration")
+		}
+		if info, err := os.Stat(sessionDir); err != nil || !info.IsDir() || info.Mode().Perm()&0077 != 0 {
+			return fmt.Errorf("Reminders session directory must exist with private permissions")
+		}
+		remindersClient = &reminders.Client{Python: python, Script: script, SessionDir: sessionDir, Email: cfg.Email, TimeZone: reminderTimeZone(cfg.DefaultLocation)}
+		defer remindersClient.Close()
+	}
+	plan = plan.WithReminders(remindersEnabled)
+
 	// 4. iCloud service + boot-time discovery (validates the credentials
 	// before starting the MCP server).
 	discoverCtx, cancel := context.WithTimeout(context.Background(), discoveryTimeout)
@@ -156,22 +199,24 @@ func runServer(cfg *config.Config, auditFormat security.AuditFormat, healthAddr 
 	s := newMCPServer(red)
 	healthEnabled := healthAddr != ""
 	mcptools.RegisterUnified(s, mcptools.Deps{
-		Service:         svc,
-		ContactsService: contactsService,
-		MailService:     mailService,
-		Audit:           audit,
-		Redactor:        red,
-		DefaultLocation: cfg.DefaultLocation,
-		Version:         version,
-		HealthEnabled:   healthEnabled,
+		Service:          svc,
+		ContactsService:  contactsService,
+		MailService:      mailService,
+		RemindersService: remindersClient,
+		Audit:            audit,
+		Redactor:         red,
+		DefaultLocation:  cfg.DefaultLocation,
+		Version:          version,
+		HealthEnabled:    healthEnabled,
 	}, plan)
 
 	// 6. Optional healthcheck (off by default).
 	if healthEnabled {
 		domains := map[string]health.DomainStatus{
-			"calendar": {Status: "ok"},
-			"contacts": {Status: domainStatus(cfg.EnableContacts)},
-			"mail":     {Status: domainStatus(cfg.EnableMail)},
+			"calendar":  {Status: "ok"},
+			"contacts":  {Status: domainStatus(cfg.EnableContacts)},
+			"mail":      {Status: domainStatus(cfg.EnableMail)},
+			"reminders": {Status: domainStatus(remindersEnabled)},
 		}
 		h, err := health.Start(healthAddr, version, domains, func() any {
 			return collectRateLimits(svc, contactsService, mailService)
@@ -199,6 +244,9 @@ func runServer(cfg *config.Config, auditFormat security.AuditFormat, healthAddr 
 	// The error logger MUST use the redacting writer, otherwise transport logs
 	// bypass stderr redaction.
 	errLogger := log.New(stderr, "", log.LstdFlags)
+	if remote != nil {
+		return serveRemote(s, remote)
+	}
 	return serveBoundedStdio(s, stdin, stdout, errLogger, red)
 }
 
@@ -211,7 +259,7 @@ func newMCPServer(red *security.Redactor) *server.MCPServer {
 		// first. It redacts each error before JSON-RPC serializes it. Keep
 		// WithRecovery as a second safety layer.
 		server.WithRecovery(),
-		server.WithInstructions("Unified Apple/iCloud server. Calendar is always available; optional Contacts and Mail tools appear only when enabled. Call the relevant list tool before using domain-specific resource identifiers."),
+		server.WithInstructions("Unified Apple/iCloud server. Calendar is always available; optional Contacts, Mail, and Reminders tools appear only when enabled. Call the relevant list tool before using domain-specific resource identifiers."),
 		server.WithToolHandlerMiddleware(timeoutMiddleware(toolTimeout)),
 		server.WithToolHandlerMiddleware(mcptools.RecoverRedactMiddleware(red)),
 	)
@@ -230,7 +278,7 @@ func timeoutMiddleware(d time.Duration) server.ToolHandlerMiddleware {
 func timeoutMiddlewareWithLimit(d, graceDuration time.Duration, slots chan struct{}) server.ToolHandlerMiddleware {
 	return func(next server.ToolHandlerFunc) server.ToolHandlerFunc {
 		return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			ctx, cancel := context.WithTimeout(ctx, d)
+			ctx, cancel := context.WithTimeout(ctx, effectiveToolTimeout(req.Params.Name, d))
 			defer cancel()
 			select {
 			case slots <- struct{}{}:
@@ -279,7 +327,8 @@ func isMutationToolName(name string) bool {
 	switch name {
 	case "create_event", "update_event", "delete_event",
 		"create_contact", "update_contact", "delete_contact",
-		"set_message_flags", "move_message", "trash_message", "send_message":
+		"set_message_flags", "move_message", "trash_message", "send_message",
+		"create_reminder", "update_reminder", "complete_reminder", "delete_reminder":
 		return true
 	default:
 		return false
@@ -371,4 +420,20 @@ func newOptionalServices(cfg *config.Config) (contacts.Service, maildomain.Servi
 		}
 	}
 	return contactsService, mailService, nil
+}
+
+// CloudKit device approval and initial PCS access can exceed Calendar's timeout.
+func effectiveToolTimeout(name string, fallback time.Duration) time.Duration {
+	switch name {
+	case "list_reminder_lists", "list_reminders", "search_reminders", "get_reminder", "create_reminder", "update_reminder", "complete_reminder", "delete_reminder":
+		return 120 * time.Second
+	}
+	return fallback
+}
+
+func reminderTimeZone(loc *time.Location) string {
+	if loc == nil {
+		return "UTC"
+	}
+	return loc.String()
 }

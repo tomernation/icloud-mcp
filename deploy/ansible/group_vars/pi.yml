@@ -1,0 +1,8 @@
+---
+# Override for a recovery target; no secrets belong here.
+stack_root: /home/mcpadmin/icloud-mcp-prep
+state_root: /var/lib/icloud-mcp
+mcp_hostname: icloud.chasid.net
+auth_hostname: auth.chasid.net
+realm: icloud
+repair_services: false

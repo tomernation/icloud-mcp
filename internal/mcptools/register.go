@@ -12,16 +12,18 @@ import (
 	"github.com/ThomasCrouzet/icloud-mcp/internal/contacts"
 	"github.com/ThomasCrouzet/icloud-mcp/internal/icloud"
 	maildomain "github.com/ThomasCrouzet/icloud-mcp/internal/mail"
+	"github.com/ThomasCrouzet/icloud-mcp/internal/reminders"
 	"github.com/ThomasCrouzet/icloud-mcp/internal/security"
 )
 
 // Deps groups the dependencies shared by all tool handlers.
 type Deps struct {
-	Service         icloud.Service
-	ContactsService contacts.Service
-	MailService     maildomain.Service
-	Audit           *security.AuditLogger
-	Redactor        *security.Redactor
+	Service          icloud.Service
+	ContactsService  contacts.Service
+	MailService      maildomain.Service
+	RemindersService reminders.Service
+	Audit            *security.AuditLogger
+	Redactor         *security.Redactor
 
 	// DefaultLocation is the timezone used to interpret start/end values
 	// supplied without an explicit RFC3339 offset (ICLOUD_MCP_DEFAULT_TZ).
@@ -44,11 +46,12 @@ type Deps struct {
 // fields prevent registration and capability reporting from being changed
 // independently after construction.
 type CapabilityPlan struct {
-	readOnly        bool
-	contactsEnabled bool
-	mailEnabled     bool
-	mailMutations   bool
-	mailSend        bool
+	readOnly         bool
+	contactsEnabled  bool
+	mailEnabled      bool
+	mailMutations    bool
+	mailSend         bool
+	remindersEnabled bool
 }
 
 // NewCapabilityPlan applies the global read-only and domain enable gates to
@@ -62,6 +65,13 @@ func NewCapabilityPlan(readOnly, contactsEnabled, mailEnabled, mailMutations, ma
 		mailSend:        mailEnabled && mailSend && !readOnly,
 	}
 }
+
+// WithReminders enables the separately authenticated CloudKit domain.
+func (p CapabilityPlan) WithReminders(enabled bool) CapabilityPlan {
+	p.remindersEnabled = enabled
+	return p
+}
+func (p CapabilityPlan) RemindersEnabled() bool { return p.remindersEnabled }
 
 // ReadOnly reports whether the global mutation kill switch is active.
 func (p CapabilityPlan) ReadOnly() bool { return p.readOnly }
@@ -106,6 +116,9 @@ func (p CapabilityPlan) RegisteredTools() []string {
 		if p.mailSend {
 			names = append(names, "send_message")
 		}
+	}
+	if p.remindersEnabled {
+		names = append(names, remindersToolNames(!p.readOnly)...)
 	}
 	names = append(names, "icloud_capabilities")
 	sort.Strings(names)
@@ -178,8 +191,11 @@ func RegisterUnified(s *server.MCPServer, deps Deps, plan CapabilityPlan) []stri
 	if plan.MailEnabled() && isNilDependency(deps.MailService) {
 		panic("mcptools: Mail tools are enabled but Mail service is nil")
 	}
+	if plan.RemindersEnabled() && isNilDependency(deps.RemindersService) {
+		panic("mcptools: Reminders service is nil")
+	}
 	mutationsEnabled := plan.CalendarWritesEnabled() || plan.ContactsWritesEnabled() ||
-		plan.MailMutationsEnabled() || plan.MailSendEnabled()
+		plan.MailMutationsEnabled() || plan.MailSendEnabled() || (plan.remindersEnabled && !plan.readOnly)
 	if mutationsEnabled && deps.Audit == nil {
 		panic("mcptools: enabled mutation tools require a non-nil audit logger")
 	}
@@ -194,6 +210,9 @@ func RegisterUnified(s *server.MCPServer, deps Deps, plan CapabilityPlan) []stri
 		registered = append(registered, RegisterMail(s, MailDeps{
 			Service: deps.MailService, Audit: deps.Audit, Redactor: deps.Redactor,
 		}, plan.MailMutationsEnabled(), plan.MailSendEnabled())...)
+	}
+	if plan.RemindersEnabled() {
+		registered = append(registered, registerReminders(s, deps, !plan.readOnly)...)
 	}
 	s.AddTool(newICloudCapabilitiesTool(), icloudCapabilitiesHandler(deps, plan))
 	registered = append(registered, "icloud_capabilities")

@@ -1,0 +1,112 @@
+---
+- name: Restore a fresh Debian 13 ARM64 Pi from an encrypted recovery bundle
+  hosts: pi
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Require explicit recovery intent and a supported target
+      ansible.builtin.assert:
+        that:
+          - restore_confirm | default(false) | bool
+          - recovery_bundle is defined
+          - ansible_facts.os_family == 'Debian'
+          - ansible_facts.distribution_major_version == '13'
+          - ansible_facts.architecture == 'aarch64'
+        fail_msg: Use a freshly imaged Debian 13 ARM64 Pi and restore_confirm=true.
+
+    - name: Check target has no application state
+      ansible.builtin.stat:
+        path: '{{ state_root }}'
+      register: old_state
+
+    - name: Refuse to overwrite a live installation
+      ansible.builtin.assert:
+        that: not old_state.stat.exists
+        fail_msg: Existing state detected. Restore to a fresh target; this playbook will not erase it.
+
+    - name: Check whether Docker is installed
+      ansible.builtin.command: docker --version
+      register: docker_version
+      changed_when: false
+      failed_when: false
+
+    - name: Install Debian Docker and Compose packages on a fresh target
+      ansible.builtin.apt:
+        name: [docker.io, docker-compose, python3, curl, ca-certificates, tar]
+        state: present
+        update_cache: true
+      when: docker_version.rc != 0
+
+    - name: Enable Docker
+      ansible.builtin.systemd_service:
+        name: docker
+        enabled: true
+        state: started
+
+    - name: Allocate root-only restore staging
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: icloud-restore-
+      register: staging
+
+    - name: Restore preserved identities and deployment
+      block:
+        - name: Decrypt and extract the trusted backup with Ansible Vault
+          ansible.builtin.unarchive:
+            src: '{{ recovery_bundle }}'
+            dest: '{{ staging.path }}'
+          no_log: true
+
+        - name: Validate bundle format
+          ansible.builtin.command:
+            argv: [cat, '{{ staging.path }}/format-version']
+          register: bundle_version
+          changed_when: false
+          failed_when: bundle_version.stdout != '1'
+
+        - name: Restore files with their recorded numeric ownership and permissions
+          ansible.builtin.shell: |
+            set -eu
+            umask 077
+            mkdir -p "$RESTORE_STATE" "$RESTORE_SOURCE" /etc/duckdns
+            cp -a "$RESTORE_STAGE/state/." "$RESTORE_STATE/"
+            cp -a "$RESTORE_STAGE/source/." "$RESTORE_SOURCE/"
+            install -m 0600 "$RESTORE_STAGE/duckdns/token" /etc/duckdns/token
+            install -d -m 0755 /usr/local/lib/duckdns
+            install -m 0755 "$RESTORE_SOURCE/deploy/duckdns/update.py" /usr/local/lib/duckdns/update.py
+            install -m 0644 "$RESTORE_SOURCE/deploy/duckdns/duckdns.service" /etc/systemd/system/duckdns.service
+            install -m 0644 "$RESTORE_SOURCE/deploy/duckdns/duckdns.timer" /etc/systemd/system/duckdns.timer
+          args:
+            executable: /bin/bash
+          environment:
+            RESTORE_STAGE: '{{ staging.path }}'
+            RESTORE_STATE: '{{ state_root }}'
+            RESTORE_SOURCE: '{{ stack_root }}'
+          no_log: true
+
+        - name: Start only the database before importing identity state
+          ansible.builtin.command:
+            argv: [docker, compose, -f, '{{ stack_root }}/deploy/compose.oauth.yaml', up, -d, --wait, --wait-timeout, '180', database]
+
+        - name: Restore Keycloak database including users, OTP and OAuth client settings
+          ansible.builtin.shell: |
+            set -eu
+            docker exec -i icloud-auth-database-1 pg_restore -U keycloak -d keycloak --clean --if-exists --exit-on-error --no-owner < "$RESTORE_STAGE/keycloak.dump"
+          environment:
+            RESTORE_STAGE: '{{ staging.path }}'
+          no_log: true
+
+        - name: Build the preserved MCP source
+          ansible.builtin.command:
+            argv: [docker, compose, -f, '{{ stack_root }}/deploy/compose.pi.yaml', --profile, production, build, icloud]
+
+        - name: Reconcile services and boot configuration
+          ansible.builtin.include_tasks: tasks/start.yml
+      always:
+        - name: Remove plaintext restore staging
+          ansible.builtin.file:
+            path: '{{ staging.path }}'
+            state: absent
+          no_log: true
+
+- ansible.builtin.import_playbook: verify.yml

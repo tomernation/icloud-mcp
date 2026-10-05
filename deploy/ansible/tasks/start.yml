@@ -1,0 +1,37 @@
+---
+- name: Enable Docker at boot
+  ansible.builtin.systemd_service:
+    name: docker
+    enabled: true
+    state: started
+
+- name: Validate OAuth compose configuration without printing secrets
+  ansible.builtin.command:
+    argv: [docker, compose, -f, '{{ stack_root }}/deploy/compose.oauth.yaml', config, --quiet]
+  changed_when: false
+  no_log: true
+
+- name: Validate MCP compose configuration without printing secrets
+  ansible.builtin.command:
+    argv: [docker, compose, -f, '{{ stack_root }}/deploy/compose.pi.yaml', --profile, production, config, --quiet]
+  changed_when: false
+  no_log: true
+
+- name: Reconcile OAuth services without upgrading images
+  ansible.builtin.command:
+    argv: [docker, compose, -f, '{{ stack_root }}/deploy/compose.oauth.yaml', up, -d, --wait, --wait-timeout, '180', --pull, missing]
+  register: oauth_up
+  changed_when: "'Created' in oauth_up.stderr or 'Recreated' in oauth_up.stderr or 'Started' in oauth_up.stderr"
+
+- name: Reconcile MCP services without upgrading images
+  ansible.builtin.command:
+    argv: [docker, compose, -f, '{{ stack_root }}/deploy/compose.pi.yaml', --profile, production, up, -d, --wait, --wait-timeout, '180', --pull, missing]
+  register: mcp_up
+  changed_when: "'Created' in mcp_up.stderr or 'Recreated' in mcp_up.stderr or 'Started' in mcp_up.stderr"
+
+- name: Enable DuckDNS timer
+  ansible.builtin.systemd_service:
+    name: duckdns.timer
+    enabled: true
+    state: started
+    daemon_reload: true

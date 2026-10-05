@@ -1,0 +1,117 @@
+---
+- name: Build and deploy the iCloud MCP server with Reminders
+  hosts: pi
+  become: true
+  gather_facts: false
+  vars:
+    source_root: '{{ playbook_dir }}/../..'
+    reminders_login_source: /home/mcpadmin/.local/state/icloud-reminders
+    refresh_reminders_session: false
+  tasks:
+    - name: Create application source directories
+      ansible.builtin.file:
+        path: '{{ stack_root }}/{{ item }}'
+        state: directory
+        mode: '0755'
+      loop: [cmd, internal, scripts, deploy]
+
+    - name: Allocate temporary source archive locally
+      ansible.builtin.tempfile:
+        state: file
+        suffix: .tar.gz
+      delegate_to: localhost
+      become: false
+      register: source_bundle
+
+    - name: Archive only application source locally
+      ansible.builtin.command:
+        argv: [tar, '--exclude=._*', -czf, '{{ source_bundle.path }}', -C, '{{ source_root }}', cmd, internal]
+      environment:
+        COPYFILE_DISABLE: '1'
+      delegate_to: localhost
+      become: false
+
+    - name: Transfer application source as one archive
+      ansible.builtin.unarchive:
+        src: '{{ source_bundle.path }}'
+        dest: '{{ stack_root }}'
+
+    - name: Remove temporary local archive
+      ansible.builtin.file:
+        path: '{{ source_bundle.path }}'
+        state: absent
+      delegate_to: localhost
+      become: false
+
+    - name: Copy build and deployment inputs
+      ansible.builtin.copy:
+        src: '{{ source_root }}/{{ item }}'
+        dest: '{{ stack_root }}/{{ item }}'
+        mode: '0644'
+      loop:
+        - go.mod
+        - go.sum
+        - Dockerfile.remote
+        - scripts/reminders_worker.py
+        - scripts/reminders-probe-requirements.txt
+        - deploy/compose.pi.yaml
+
+    - name: Check for production Reminders login
+      ansible.builtin.stat:
+        path: '{{ state_root }}/reminders-session'
+      register: reminders_session
+
+    - name: Create private production session directory
+      ansible.builtin.file:
+        path: '{{ state_root }}/reminders-session'
+        state: directory
+        owner: '65532'
+        group: '65532'
+        mode: '0700'
+
+    - name: Import already authenticated Apple session on first deployment
+      ansible.builtin.command:
+        argv: [cp, -a, '{{ reminders_login_source }}/.', '{{ state_root }}/reminders-session/']
+      when: not reminders_session.stat.exists or refresh_reminders_session | bool
+      no_log: true
+
+    - name: Set session ownership for the unprivileged container
+      ansible.builtin.file:
+        path: '{{ state_root }}/reminders-session'
+        owner: '65532'
+        group: '65532'
+        recurse: true
+      no_log: true
+
+    - name: Enable Reminders in the existing environment file
+      ansible.builtin.lineinfile:
+        path: '{{ stack_root }}/deploy/pi.env'
+        regexp: '^ICLOUD_MCP_ENABLE_REMINDERS='
+        line: ICLOUD_MCP_ENABLE_REMINDERS=true
+      no_log: true
+
+    - name: Validate compose without exposing configuration
+      ansible.builtin.command:
+        argv: [docker, compose, -f, '{{ stack_root }}/deploy/compose.pi.yaml', --profile, production, config, --quiet]
+      changed_when: false
+      no_log: true
+
+    - name: Build the MCP image
+      ansible.builtin.command:
+        argv: [docker, compose, -f, '{{ stack_root }}/deploy/compose.pi.yaml', --profile, production, build, icloud]
+      async: 1800
+      poll: 0
+      register: mcp_build
+
+    - name: Wait for image build
+      ansible.builtin.async_status:
+        jid: '{{ mcp_build.ansible_job_id }}'
+      register: mcp_build_result
+      until: mcp_build_result.finished
+      retries: 180
+      delay: 10
+      no_log: true
+
+    - name: Deploy only the MCP container
+      ansible.builtin.command:
+        argv: [docker, compose, -f, '{{ stack_root }}/deploy/compose.pi.yaml', --profile, production, up, -d, --no-deps, --wait, --wait-timeout, '90', icloud]

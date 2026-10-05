@@ -1,0 +1,85 @@
+---
+- name: Make an encrypted off-Pi recovery bundle
+  hosts: pi
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Require an explicit destination and a separately stored vault password file
+      ansible.builtin.assert:
+        that:
+          - backup_output is defined
+          - vault_password_file is defined
+          - backup_output.startswith('/')
+          - vault_password_file.startswith('/')
+        fail_msg: Supply absolute backup_output and vault_password_file paths on the controller.
+
+    - name: Allocate root-only staging on the Pi
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: icloud-recovery-
+      register: staging
+
+    - name: Back up database, configuration, credentials and TLS state
+      block:
+        - name: Produce transactionally consistent PostgreSQL dump and recovery archive
+          ansible.builtin.shell: |
+            set -eu
+            umask 077
+            mkdir -p "$RECOVERY_STAGE/source" "$RECOVERY_STAGE/state" "$RECOVERY_STAGE/duckdns"
+            docker exec icloud-auth-database-1 pg_dump -U keycloak -d keycloak -Fc > "$RECOVERY_STAGE/keycloak.dump"
+            docker exec -i icloud-auth-database-1 pg_restore --list < "$RECOVERY_STAGE/keycloak.dump" > /dev/null
+            tar -C "$RECOVERY_STATE" --exclude='./oauth/postgres' -cf - . | tar -C "$RECOVERY_STAGE/state" -xf -
+            tar -C "$RECOVERY_SOURCE" -cf - cmd internal deploy go.mod go.sum Dockerfile.remote | tar -C "$RECOVERY_STAGE/source" -xf -
+            cp /etc/duckdns/token "$RECOVERY_STAGE/duckdns/token"
+            printf '1\n' > "$RECOVERY_STAGE/format-version"
+            tar -C "$RECOVERY_STAGE" -czf "$RECOVERY_STAGE/bundle.tar.gz" state source duckdns keycloak.dump format-version
+          args:
+            executable: /bin/bash
+          environment:
+            RECOVERY_STAGE: '{{ staging.path }}'
+            RECOVERY_STATE: '{{ state_root }}'
+            RECOVERY_SOURCE: '{{ stack_root }}'
+          no_log: true
+
+        - name: Allocate private controller staging
+          ansible.builtin.tempfile:
+            state: directory
+            prefix: icloud-recovery-
+          delegate_to: localhost
+          become: false
+          register: local_staging
+
+        - name: Download archive through SSH
+          ansible.builtin.fetch:
+            src: '{{ staging.path }}/bundle.tar.gz'
+            dest: '{{ local_staging.path }}/bundle.tar.gz'
+            flat: true
+          no_log: true
+
+        - name: Encrypt archive on the controller before publishing the backup
+          ansible.builtin.command:
+            argv: ['{{ ansible_playbook_python | dirname }}/ansible-vault', encrypt, --vault-password-file, '{{ vault_password_file }}', --output, '{{ backup_output }}', '{{ local_staging.path }}/bundle.tar.gz']
+          delegate_to: localhost
+          become: false
+          no_log: true
+
+        - name: Restrict encrypted backup permissions
+          ansible.builtin.file:
+            path: '{{ backup_output }}'
+            mode: '0600'
+          delegate_to: localhost
+          become: false
+      always:
+        - name: Remove plaintext staging from the Pi
+          ansible.builtin.file:
+            path: '{{ staging.path }}'
+            state: absent
+          no_log: true
+        - name: Remove plaintext staging from the controller
+          ansible.builtin.file:
+            path: '{{ local_staging.path }}'
+            state: absent
+          delegate_to: localhost
+          become: false
+          when: local_staging is defined and local_staging.path is defined
+          no_log: true

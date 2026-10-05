@@ -17,19 +17,22 @@ func newICloudCapabilitiesTool() mcp.Tool {
 }
 
 type icloudDomains struct {
-	Calendar bool `json:"calendar"`
-	Contacts bool `json:"contacts"`
-	Mail     bool `json:"mail"`
+	Reminders bool `json:"reminders"`
+	Calendar  bool `json:"calendar"`
+	Contacts  bool `json:"contacts"`
+	Mail      bool `json:"mail"`
 }
 
 type icloudCapabilityGroups struct {
-	CalendarRead  bool `json:"calendarRead"`
-	CalendarWrite bool `json:"calendarWrite"`
-	ContactsRead  bool `json:"contactsRead"`
-	ContactsWrite bool `json:"contactsWrite"`
-	MailRead      bool `json:"mailRead"`
-	MailMutation  bool `json:"mailMutation"`
-	MailSend      bool `json:"mailSend"`
+	RemindersRead  bool `json:"remindersRead"`
+	RemindersWrite bool `json:"remindersWrite"`
+	CalendarRead   bool `json:"calendarRead"`
+	CalendarWrite  bool `json:"calendarWrite"`
+	ContactsRead   bool `json:"contactsRead"`
+	ContactsWrite  bool `json:"contactsWrite"`
+	MailRead       bool `json:"mailRead"`
+	MailMutation   bool `json:"mailMutation"`
+	MailSend       bool `json:"mailSend"`
 }
 
 type icloudCapabilitiesResponse struct {
@@ -56,18 +59,21 @@ func icloudCapabilitiesHandler(deps Deps, plan CapabilityPlan) server.ToolHandle
 			ReadOnly:          plan.ReadOnly(),
 			HealthcheckActive: deps.HealthEnabled,
 			Domains: icloudDomains{
-				Calendar: true,
-				Contacts: plan.ContactsEnabled(),
-				Mail:     plan.MailEnabled(),
+				Calendar:  true,
+				Reminders: plan.RemindersEnabled(),
+				Contacts:  plan.ContactsEnabled(),
+				Mail:      plan.MailEnabled(),
 			},
 			CapabilityGroups: icloudCapabilityGroups{
-				CalendarRead:  true,
-				CalendarWrite: plan.CalendarWritesEnabled(),
-				ContactsRead:  plan.ContactsEnabled(),
-				ContactsWrite: plan.ContactsWritesEnabled(),
-				MailRead:      plan.MailEnabled(),
-				MailMutation:  plan.MailMutationsEnabled(),
-				MailSend:      plan.MailSendEnabled(),
+				CalendarRead:   true,
+				RemindersRead:  plan.RemindersEnabled(),
+				RemindersWrite: plan.RemindersEnabled() && !plan.ReadOnly(),
+				CalendarWrite:  plan.CalendarWritesEnabled(),
+				ContactsRead:   plan.ContactsEnabled(),
+				ContactsWrite:  plan.ContactsWritesEnabled(),
+				MailRead:       plan.MailEnabled(),
+				MailMutation:   plan.MailMutationsEnabled(),
+				MailSend:       plan.MailSendEnabled(),
 			},
 			Tools:     tools,
 			ToolCount: len(tools),
